@@ -132,7 +132,7 @@
           "Ergonomics profile to use. "                                     \
           "Options include \"shared\" for when the JVM is running "         \
           "in a shared environment and \"dedicated\" for when the "         \
-          "JVM is running on a system with dedicated resources")            \                                           \
+          "JVM is running on a system with dedicated resources")            \
                                                                             \
   product(uint, ParallelGCThreads, 0,                                       \
           "Number of parallel threads parallel gc will use")                \
