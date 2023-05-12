@@ -1538,6 +1538,22 @@ jint Arguments::set_ergonomics_flags() {
   return JNI_OK;
 }
 
+void Arguments::set_ergonomics_profile() {
+  if (FLAG_IS_DEFAULT(ErgonomicsProfile)){
+
+#ifdef LINUX
+    if (OSContainer::is_containerized()){
+      FLAG_SET_ERGO(ErgonomicsProfile, "dedicated");
+    }
+#endif //LINUX
+
+  } else {
+    if !(strcmp(ErgonomicsProfile, "balanced") == 0 || strcmp(ErgonomicsProfile, "dedicated") == 0) {
+      vm_exit_during_initialization(err_msg("Unsupported ErgonomicsProfile: %s", ErgonomicsProfile));
+    }
+  }
+}
+
 size_t Arguments::limit_heap_by_allocatable_memory(size_t limit) {
   size_t max_allocatable;
   size_t result = limit;
@@ -1599,108 +1615,143 @@ void Arguments::set_heap_size() {
       !FLAG_IS_DEFAULT(InitialRAMFraction))
     InitialRAMPercentage = 100.0 / InitialRAMFraction;
 
-  // If the maximum heap size has not been set with -Xmx,
-  // then set it as fraction of the size of physical memory,
-  // respecting the maximum and minimum sizes of the heap.
-  if (FLAG_IS_DEFAULT(MaxHeapSize)) {
-    julong reasonable_max = (julong)((phys_mem * MaxRAMPercentage) / 100);
-    const julong reasonable_min = (julong)((phys_mem * MinRAMPercentage) / 100);
-    if (reasonable_min < MaxHeapSize) {
-      // Small physical memory, so use a minimum fraction of it for the heap
-      reasonable_max = reasonable_min;
-    } else {
-      // Not-small physical memory, so require a heap at least
-      // as large as MaxHeapSize
-      reasonable_max = MAX2(reasonable_max, (julong)MaxHeapSize);
+  if (strcmp(ErgonomicsProfile, "balanced") == 0) {
+    // If the maximum heap size has not been set with -Xmx,
+    // then set it as fraction of the size of physical memory,
+    // respecting the maximum and minimum sizes of the heap.
+    if (FLAG_IS_DEFAULT(MaxHeapSize)) {
+      julong reasonable_max = (julong)((phys_mem * MaxRAMPercentage) / 100);
+      const julong reasonable_min = (julong)((phys_mem * MinRAMPercentage) / 100);
+      if (reasonable_min < MaxHeapSize) {
+        // Small physical memory, so use a minimum fraction of it for the heap
+        reasonable_max = reasonable_min;
+      } else {
+        // Not-small physical memory, so require a heap at least
+        // as large as MaxHeapSize
+        reasonable_max = MAX2(reasonable_max, (julong)MaxHeapSize);
+      }
+
+      if (!FLAG_IS_DEFAULT(ErgoHeapSizeLimit) && ErgoHeapSizeLimit != 0) {
+        // Limit the heap size to ErgoHeapSizeLimit
+        reasonable_max = MIN2(reasonable_max, (julong)ErgoHeapSizeLimit);
+      }
+
+      reasonable_max = limit_heap_by_allocatable_memory(reasonable_max);
+
+      if (!FLAG_IS_DEFAULT(InitialHeapSize)) {
+        // An initial heap size was specified on the command line,
+        // so be sure that the maximum size is consistent.  Done
+        // after call to limit_heap_by_allocatable_memory because that
+        // method might reduce the allocation size.
+        reasonable_max = MAX2(reasonable_max, (julong)InitialHeapSize);
+      } else if (!FLAG_IS_DEFAULT(MinHeapSize)) {
+        reasonable_max = MAX2(reasonable_max, (julong)MinHeapSize);
+      }
+
+#ifdef _LP64
+      if (UseCompressedOops || UseCompressedClassPointers) {
+        // HeapBaseMinAddress can be greater than default but not less than.
+        if (!FLAG_IS_DEFAULT(HeapBaseMinAddress)) {
+          if (HeapBaseMinAddress < DefaultHeapBaseMinAddress) {
+            // matches compressed oops printing flags
+            log_debug(gc, heap, coops)("HeapBaseMinAddress must be at least " SIZE_FORMAT
+                                      " (" SIZE_FORMAT "G) which is greater than value given " SIZE_FORMAT,
+                                      DefaultHeapBaseMinAddress,
+                                      DefaultHeapBaseMinAddress/G,
+                                      HeapBaseMinAddress);
+            FLAG_SET_ERGO(HeapBaseMinAddress, DefaultHeapBaseMinAddress);
+          }
+        }
+      }
+      if (UseCompressedOops) {
+        // Limit the heap size to the maximum possible when using compressed oops
+        julong max_coop_heap = (julong)max_heap_for_compressed_oops();
+
+        if (HeapBaseMinAddress + MaxHeapSize < max_coop_heap) {
+          // Heap should be above HeapBaseMinAddress to get zero based compressed oops
+          // but it should be not less than default MaxHeapSize.
+          max_coop_heap -= HeapBaseMinAddress;
+        }
+
+        // If user specified flags prioritizing os physical
+        // memory limits, then disable compressed oops if
+        // limits exceed max_coop_heap and UseCompressedOops
+        // was not specified.
+        if (reasonable_max > max_coop_heap) {
+          if (FLAG_IS_ERGO(UseCompressedOops) && override_coop_limit) {
+            log_info(cds)("UseCompressedOops and UseCompressedClassPointers have been disabled due to"
+              " max heap " SIZE_FORMAT " > compressed oop heap " SIZE_FORMAT ". "
+              "Please check the setting of MaxRAMPercentage %5.2f."
+              ,(size_t)reasonable_max, (size_t)max_coop_heap, MaxRAMPercentage);
+            FLAG_SET_ERGO(UseCompressedOops, false);
+          } else {
+            reasonable_max = MIN2(reasonable_max, max_coop_heap);
+          }
+        }
+      }
+#endif // _LP64
+
+      log_trace(gc, heap)("  Maximum heap size " SIZE_FORMAT, (size_t) reasonable_max);
+      FLAG_SET_ERGO(MaxHeapSize, (size_t)reasonable_max);
     }
+
+    // If the minimum or initial heap_size have not been set or requested to be set
+    // ergonomically, set them accordingly.
+    if (InitialHeapSize == 0 || MinHeapSize == 0) {
+      julong reasonable_minimum = (julong)(OldSize + NewSize);
+
+      reasonable_minimum = MIN2(reasonable_minimum, (julong)MaxHeapSize);
+
+      reasonable_minimum = limit_heap_by_allocatable_memory(reasonable_minimum);
+
+      if (InitialHeapSize == 0) {
+        julong reasonable_initial = (julong)((phys_mem * InitialRAMPercentage) / 100);
+        reasonable_initial = limit_heap_by_allocatable_memory(reasonable_initial);
+
+        reasonable_initial = MAX3(reasonable_initial, reasonable_minimum, (julong)MinHeapSize);
+        reasonable_initial = MIN2(reasonable_initial, (julong)MaxHeapSize);
+
+        FLAG_SET_ERGO(InitialHeapSize, (size_t)reasonable_initial);
+        log_trace(gc, heap)("  Initial heap size " SIZE_FORMAT, InitialHeapSize);
+      }
+      // If the minimum heap size has not been set (via -Xms or -XX:MinHeapSize),
+      // synchronize with InitialHeapSize to avoid errors with the default value.
+      if (MinHeapSize == 0) {
+        FLAG_SET_ERGO(MinHeapSize, MIN2((size_t)reasonable_minimum, InitialHeapSize));
+        log_trace(gc, heap)("  Minimum heap size " SIZE_FORMAT, MinHeapSize);
+      }
+    }
+
+  // Heap sizing for the dedicated ergonomics profile uses DedicatedRAMPercentage
+  // in place of MaxRAMPercentage, MinRAMPercentage, and InitialRAMPercentage.
+  // open Q - how do we want to deal with compressed oops?
+  } else if (strcmp(ErgonomicsProfile, "dedicated") == 0){
+    double DedicatedRAMPercentage = 75.0;
+    julong dedicated_heap = (julong)((phys_mem * DedicatedRAMPercentage) / 100);
 
     if (!FLAG_IS_DEFAULT(ErgoHeapSizeLimit) && ErgoHeapSizeLimit != 0) {
       // Limit the heap size to ErgoHeapSizeLimit
-      reasonable_max = MIN2(reasonable_max, (julong)ErgoHeapSizeLimit);
+      dedicated_heap = MIN2(dedicated_heap, (julong)ErgoHeapSizeLimit);
     }
 
-    reasonable_max = limit_heap_by_allocatable_memory(reasonable_max);
+    dedicated_heap = limit_heap_by_allocatable_memory(dedicated_heap);
 
-    if (!FLAG_IS_DEFAULT(InitialHeapSize)) {
-      // An initial heap size was specified on the command line,
-      // so be sure that the maximum size is consistent.  Done
-      // after call to limit_heap_by_allocatable_memory because that
-      // method might reduce the allocation size.
-      reasonable_max = MAX2(reasonable_max, (julong)InitialHeapSize);
-    } else if (!FLAG_IS_DEFAULT(MinHeapSize)) {
-      reasonable_max = MAX2(reasonable_max, (julong)MinHeapSize);
+    if (FLAG_IS_DEFAULT(MaxHeapSize)) {
+      julong reasonable_max = MAX3(dedicated_heap, (julong)InitialHeapSize, (julong)MinHeapSize);
+      reasonable_max = limit_heap_by_allocatable_memory(reasonable_max);
+
+      FLAG_SET_ERGO(MaxHeapSize, (size_t)reasonable_max);
+      log_trace(gc, heap)("  Maximum heap size " SIZE_FORMAT, MaxHeapSize);
     }
 
-#ifdef _LP64
-    if (UseCompressedOops || UseCompressedClassPointers) {
-      // HeapBaseMinAddress can be greater than default but not less than.
-      if (!FLAG_IS_DEFAULT(HeapBaseMinAddress)) {
-        if (HeapBaseMinAddress < DefaultHeapBaseMinAddress) {
-          // matches compressed oops printing flags
-          log_debug(gc, heap, coops)("HeapBaseMinAddress must be at least " SIZE_FORMAT
-                                     " (" SIZE_FORMAT "G) which is greater than value given " SIZE_FORMAT,
-                                     DefaultHeapBaseMinAddress,
-                                     DefaultHeapBaseMinAddress/G,
-                                     HeapBaseMinAddress);
-          FLAG_SET_ERGO(HeapBaseMinAddress, DefaultHeapBaseMinAddress);
-        }
-      }
-    }
-    if (UseCompressedOops) {
-      // Limit the heap size to the maximum possible when using compressed oops
-      julong max_coop_heap = (julong)max_heap_for_compressed_oops();
-
-      if (HeapBaseMinAddress + MaxHeapSize < max_coop_heap) {
-        // Heap should be above HeapBaseMinAddress to get zero based compressed oops
-        // but it should be not less than default MaxHeapSize.
-        max_coop_heap -= HeapBaseMinAddress;
-      }
-
-      // If user specified flags prioritizing os physical
-      // memory limits, then disable compressed oops if
-      // limits exceed max_coop_heap and UseCompressedOops
-      // was not specified.
-      if (reasonable_max > max_coop_heap) {
-        if (FLAG_IS_ERGO(UseCompressedOops) && override_coop_limit) {
-          log_info(cds)("UseCompressedOops and UseCompressedClassPointers have been disabled due to"
-            " max heap " SIZE_FORMAT " > compressed oop heap " SIZE_FORMAT ". "
-            "Please check the setting of MaxRAMPercentage %5.2f."
-            ,(size_t)reasonable_max, (size_t)max_coop_heap, MaxRAMPercentage);
-          FLAG_SET_ERGO(UseCompressedOops, false);
-        } else {
-          reasonable_max = MIN2(reasonable_max, max_coop_heap);
-        }
-      }
-    }
-#endif // _LP64
-
-    log_trace(gc, heap)("  Maximum heap size " SIZE_FORMAT, (size_t) reasonable_max);
-    FLAG_SET_ERGO(MaxHeapSize, (size_t)reasonable_max);
-  }
-
-  // If the minimum or initial heap_size have not been set or requested to be set
-  // ergonomically, set them accordingly.
-  if (InitialHeapSize == 0 || MinHeapSize == 0) {
-    julong reasonable_minimum = (julong)(OldSize + NewSize);
-
-    reasonable_minimum = MIN2(reasonable_minimum, (julong)MaxHeapSize);
-
-    reasonable_minimum = limit_heap_by_allocatable_memory(reasonable_minimum);
-
+    // If the minimum and initial heap_size have not been set or requested 
+    // to be set ergonomically, set them equal to the maximum heap size.
     if (InitialHeapSize == 0) {
-      julong reasonable_initial = (julong)((phys_mem * InitialRAMPercentage) / 100);
-      reasonable_initial = limit_heap_by_allocatable_memory(reasonable_initial);
-
-      reasonable_initial = MAX3(reasonable_initial, reasonable_minimum, (julong)MinHeapSize);
-      reasonable_initial = MIN2(reasonable_initial, (julong)MaxHeapSize);
-
-      FLAG_SET_ERGO(InitialHeapSize, (size_t)reasonable_initial);
+      FLAG_SET_ERGO(InitialHeapSize, MaxHeapSize);
       log_trace(gc, heap)("  Initial heap size " SIZE_FORMAT, InitialHeapSize);
     }
-    // If the minimum heap size has not been set (via -Xms or -XX:MinHeapSize),
-    // synchronize with InitialHeapSize to avoid errors with the default value.
     if (MinHeapSize == 0) {
-      FLAG_SET_ERGO(MinHeapSize, MIN2((size_t)reasonable_minimum, InitialHeapSize));
+      FLAG_SET_ERGO(MinHeapSize, MIN2(MaxHeapSize, InitialHeapSize));
       log_trace(gc, heap)("  Minimum heap size " SIZE_FORMAT, MinHeapSize);
     }
   }
@@ -3985,6 +4036,8 @@ jint Arguments::apply_ergo() {
   // Set flags based on ergonomics.
   jint result = set_ergonomics_flags();
   if (result != JNI_OK) return result;
+
+  set_ergonomics_profile();
 
   // Set heap size based on available physical memory
   set_heap_size();
