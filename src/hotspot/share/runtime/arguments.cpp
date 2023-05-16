@@ -1548,7 +1548,7 @@ void Arguments::set_ergonomics_profile() {
 #endif //LINUX
 
   } else {
-    if !(strcmp(ErgonomicsProfile, "balanced") == 0 || strcmp(ErgonomicsProfile, "dedicated") == 0) {
+    if (strcmp(ErgonomicsProfile, "shared") != 0 && strcmp(ErgonomicsProfile, "dedicated") != 0) {
       vm_exit_during_initialization(err_msg("Unsupported ErgonomicsProfile: %s", ErgonomicsProfile));
     }
   }
@@ -1615,7 +1615,7 @@ void Arguments::set_heap_size() {
       !FLAG_IS_DEFAULT(InitialRAMFraction))
     InitialRAMPercentage = 100.0 / InitialRAMFraction;
 
-  if (strcmp(ErgonomicsProfile, "balanced") == 0) {
+  if (strcmp(ErgonomicsProfile, "shared") == 0) {
     // If the maximum heap size has not been set with -Xmx,
     // then set it as fraction of the size of physical memory,
     // respecting the maximum and minimum sizes of the heap.
@@ -1725,7 +1725,7 @@ void Arguments::set_heap_size() {
   // Heap sizing for the dedicated ergonomics profile uses DedicatedRAMPercentage
   // in place of MaxRAMPercentage, MinRAMPercentage, and InitialRAMPercentage.
   // open Q - how do we want to deal with compressed oops?
-  } else if (strcmp(ErgonomicsProfile, "dedicated") == 0){
+  } else if (strcmp(ErgonomicsProfile, "dedicated") == 0) {
     double DedicatedRAMPercentage = 75.0;
     julong dedicated_heap = (julong)((phys_mem * DedicatedRAMPercentage) / 100);
 
