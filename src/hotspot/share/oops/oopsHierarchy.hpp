@@ -37,9 +37,6 @@
 // Global offset instead of address for an oop within a java object.
 enum class narrowOop : uint32_t { null = 0 };
 
-// If compressed klass pointers then use narrowKlass.
-typedef juint  narrowKlass;
-
 typedef void* OopOrNarrowOopStar;
 
 #ifndef CHECK_UNHANDLED_OOPS
@@ -167,6 +164,10 @@ template <typename T> inline oop cast_to_oop(T value) {
 }
 template <typename T> inline T cast_from_oop(oop o) {
   return (T)(CHECK_UNHANDLED_OOPS_ONLY((oopDesc*))o);
+}
+
+inline intptr_t p2i(narrowOop o) {
+  return static_cast<intptr_t>(o);
 }
 
 // The metadata hierarchy is separate from the oop hierarchy
